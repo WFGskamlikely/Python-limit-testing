@@ -1,0 +1,459 @@
+#!/usr/bin/env python3
+"""
+PageSpeed Insights - Performance, SEO & Core Web Vitals Logger
+Usage:
+    python3 pagespeed.py https://example.com
+    python3 pagespeed.py --file urls.txt
+    python3 pagespeed.py https://example.com https://other.com --strategy both
+"""
+
+import argparse
+import csv
+import json
+import os
+import sys
+import time
+from datetime import datetime
+from urllib.parse import quote_plus
+
+try:
+    import requests
+except ImportError:
+    print("Installing requests...")
+    os.system(f"{sys.executable} -m pip install requests -q")
+    import requests
+
+API_URL = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
+LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pagespeed_logs")
+
+
+def get_api_key():
+    key = os.environ.get("PAGESPEED_API_KEY", "")
+    if not key:
+        key_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".pagespeed_key")
+        if os.path.exists(key_file):
+            with open(key_file) as f:
+                key = f.read().strip()
+    if not key:
+        print("WARNING: No API key set. Requests may be rate-limited.")
+        print("  Set PAGESPEED_API_KEY env var or create .pagespeed_key file")
+    return key
+
+
+def fetch_pagespeed(url, strategy="mobile", api_key=""):
+    params = {
+        "url": url,
+        "strategy": strategy,
+        "category": ["performance", "seo", "best-practices", "accessibility"],
+    }
+    if api_key:
+        params["key"] = api_key
+
+    resp = requests.get(API_URL, params=params, timeout=120)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def extract_metrics(data):
+    lhr = data.get("lighthouseResult", {})
+    categories = lhr.get("categories", {})
+    audits = lhr.get("audits", {})
+
+    # Core Web Vitals
+    def ms(audit_key):
+        val = audits.get(audit_key, {}).get("numericValue")
+        return round(val, 1) if val is not None else None
+
+    # Score grading
+    def letter_grade(score):
+        if score >= 90: return "A"
+        if score >= 80: return "B"
+        if score >= 70: return "C"
+        if score >= 50: return "D"
+        return "F"
+
+    # CWV grading
+    def fcp_grade(v):
+        if v is None: return "N/A"
+        if v <= 1800: return "A"
+        if v <= 2400: return "B"
+        if v <= 3000: return "C"
+        if v <= 4000: return "D"
+        return "F"
+
+    def lcp_grade(v):
+        if v is None: return "N/A"
+        if v <= 2500: return "A"
+        if v <= 3000: return "B"
+        if v <= 4000: return "C"
+        if v <= 5000: return "D"
+        return "F"
+
+    def tbt_grade(v):
+        if v is None: return "N/A"
+        if v <= 200: return "A"
+        if v <= 400: return "B"
+        if v <= 600: return "C"
+        if v <= 1000: return "D"
+        return "F"
+
+    def cls_grade(v):
+        if v is None: return "N/A"
+        if v <= 0.1: return "A"
+        if v <= 0.15: return "B"
+        if v <= 0.25: return "C"
+        if v <= 0.4: return "D"
+        return "F"
+
+    def si_grade(v):
+        if v is None: return "N/A"
+        if v <= 3400: return "A"
+        if v <= 4200: return "B"
+        if v <= 5800: return "C"
+        if v <= 8000: return "D"
+        return "F"
+
+    perf = int((categories.get("performance", {}).get("score") or 0) * 100)
+    seo = int((categories.get("seo", {}).get("score") or 0) * 100)
+    bp = int((categories.get("best-practices", {}).get("score") or 0) * 100)
+    a11y = int((categories.get("accessibility", {}).get("score") or 0) * 100)
+    fcp = ms("first-contentful-paint")
+    lcp = ms("largest-contentful-paint")
+    tbt = ms("total-blocking-time")
+    cls_val = audits.get("cumulative-layout-shift", {}).get("numericValue")
+    si = ms("speed-index")
+    byte_weight = audits.get("total-byte-weight", {}).get("numericValue")
+
+    # Build synopsis for sales reps
+    def build_synopsis(perf, seo, bp, a11y, fcp, lcp, tbt, cls_val, si, byte_weight, seo_issues, opps):
+        lines = []
+        # Overall verdict
+        avg = (perf + seo + bp + a11y) / 4
+        if avg >= 90:
+            lines.append("OVERALL: This site is in great shape across the board.")
+        elif avg >= 70:
+            lines.append("OVERALL: This site is decent but has clear room for improvement.")
+        elif avg >= 50:
+            lines.append("OVERALL: This site has significant issues that are likely hurting conversions and rankings.")
+        else:
+            lines.append("OVERALL: This site has serious problems — users are likely leaving before it even loads.")
+
+        # Performance
+        lines.append("")
+        if perf >= 90:
+            lines.append(f"SPEED ({perf}/100 - Grade {letter_grade(perf)}): Site loads fast. Users aren't waiting around.")
+        elif perf >= 70:
+            lines.append(f"SPEED ({perf}/100 - Grade {letter_grade(perf)}): Page speed is OK but not competitive. Slower pages lose ~7% conversions per second of delay.")
+        elif perf >= 50:
+            lines.append(f"SPEED ({perf}/100 - Grade {letter_grade(perf)}): Site is noticeably slow. Studies show 53% of mobile users leave if a page takes over 3 seconds to load.")
+        else:
+            lines.append(f"SPEED ({perf}/100 - Grade {letter_grade(perf)}): Site is very slow. This is actively driving away visitors and hurting Google rankings.")
+
+        # LCP detail
+        if lcp is not None:
+            if lcp > 4000:
+                lines.append(f"  -> Main content takes {round(lcp/1000, 1)}s to appear. Google wants this under 2.5s.")
+            elif lcp > 2500:
+                lines.append(f"  -> Main content takes {round(lcp/1000, 1)}s to appear. Close to Google's 2.5s threshold but could be faster.")
+
+        # TBT detail
+        if tbt is not None and tbt > 600:
+            lines.append(f"  -> Page is unresponsive/frozen for {round(tbt/1000, 1)}s while loading. Buttons and links won't work during this time.")
+
+        # Page weight
+        if byte_weight is not None:
+            mb = round(byte_weight / 1048576, 1)
+            if mb > 3:
+                lines.append(f"  -> Page weighs {mb}MB — very heavy. Costs users on mobile data and slows everything down.")
+            elif mb > 1.5:
+                lines.append(f"  -> Page weighs {mb}MB — on the heavier side. Could be optimized.")
+
+        # SEO
+        lines.append("")
+        if seo >= 90:
+            lines.append(f"SEO ({seo}/100 - Grade {letter_grade(seo)}): Search engine optimization looks solid. Google can crawl and index this site properly.")
+        elif seo >= 70:
+            lines.append(f"SEO ({seo}/100 - Grade {letter_grade(seo)}): Some SEO issues that could be limiting search visibility.")
+        else:
+            lines.append(f"SEO ({seo}/100 - Grade {letter_grade(seo)}): Significant SEO problems. This site is likely invisible to many potential customers searching on Google.")
+
+        if seo_issues:
+            for issue in seo_issues.values():
+                lines.append(f"  -> Issue: {issue['title']}")
+
+        # Best Practices
+        lines.append("")
+        if bp >= 90:
+            lines.append(f"BEST PRACTICES ({bp}/100 - Grade {letter_grade(bp)}): Site follows modern web security and coding standards.")
+        elif bp >= 70:
+            lines.append(f"BEST PRACTICES ({bp}/100 - Grade {letter_grade(bp)}): Some outdated practices or minor security concerns detected.")
+        else:
+            lines.append(f"BEST PRACTICES ({bp}/100 - Grade {letter_grade(bp)}): Site has security or technical issues that need attention. Could affect user trust.")
+
+        # Accessibility
+        lines.append("")
+        if a11y >= 90:
+            lines.append(f"ACCESSIBILITY ({a11y}/100 - Grade {letter_grade(a11y)}): Site is usable for people with disabilities. Good for compliance (ADA/WCAG).")
+        elif a11y >= 70:
+            lines.append(f"ACCESSIBILITY ({a11y}/100 - Grade {letter_grade(a11y)}): Some accessibility gaps. Could expose the business to ADA compliance risks.")
+        else:
+            lines.append(f"ACCESSIBILITY ({a11y}/100 - Grade {letter_grade(a11y)}): Major accessibility issues. Risk of ADA lawsuits and excluding ~15% of potential customers with disabilities.")
+
+        # Opportunities
+        if opps:
+            lines.append("")
+            lines.append("QUICK WINS:")
+            for v in sorted(opps.values(), key=lambda x: -x["savings_ms"]):
+                secs = round(v['savings_ms'] / 1000, 1)
+                lines.append(f"  -> {v['title']}: could save ~{secs}s load time")
+
+        return "\n".join(lines)
+
+    # SEO audit details
+    seo_audits = {}
+    seo_cat = categories.get("seo", {})
+    for ref in seo_cat.get("auditRefs", []):
+        audit_id = ref.get("id", "")
+        audit = audits.get(audit_id, {})
+        if audit.get("score") is not None and audit["score"] < 1:
+            seo_audits[audit_id] = {
+                "title": audit.get("title", ""),
+                "description": audit.get("description", ""),
+                "score": audit["score"],
+            }
+
+    # Performance opportunities
+    opportunities = {}
+    for ref in categories.get("performance", {}).get("auditRefs", []):
+        audit_id = ref.get("id", "")
+        audit = audits.get(audit_id, {})
+        savings = audit.get("numericValue")
+        if ref.get("group") == "load-opportunities" and savings and savings > 0:
+            opportunities[audit_id] = {
+                "title": audit.get("title", ""),
+                "savings_ms": round(savings, 1),
+            }
+
+    synopsis = build_synopsis(perf, seo, bp, a11y, fcp, lcp, tbt, cls_val, si, byte_weight, seo_audits, opportunities)
+
+    metrics = {
+        "url": data.get("id", ""),
+        "strategy": lhr.get("configSettings", {}).get("formFactor", ""),
+        "timestamp": datetime.now().isoformat(),
+        "fetch_time": lhr.get("fetchTime", ""),
+        # Scores with grades
+        "performance_score": perf,
+        "performance_grade": letter_grade(perf),
+        "seo_score": seo,
+        "seo_grade": letter_grade(seo),
+        "best_practices_score": bp,
+        "best_practices_grade": letter_grade(bp),
+        "accessibility_score": a11y,
+        "accessibility_grade": letter_grade(a11y),
+        # Core Web Vitals with grades
+        "fcp_ms": fcp,
+        "fcp_grade": fcp_grade(fcp),
+        "lcp_ms": lcp,
+        "lcp_grade": lcp_grade(lcp),
+        "tbt_ms": tbt,
+        "tbt_grade": tbt_grade(tbt),
+        "cls": cls_val,
+        "cls_grade": cls_grade(cls_val),
+        "si_ms": si,
+        "si_grade": si_grade(si),
+        "tti_ms": ms("interactive"),
+        # Extra
+        "server_response_ms": ms("server-response-time"),
+        "dom_size": audits.get("dom-size", {}).get("numericValue"),
+        "total_byte_weight": byte_weight,
+        # Issues & opportunities
+        "seo_issues": seo_audits,
+        "opportunities": opportunities,
+        # Sales rep synopsis
+        "synopsis": synopsis,
+    }
+
+    return metrics
+
+
+def print_report(m):
+    print(f"\n{'='*64}")
+    print(f"  {m['url']}  [{m['strategy'].upper()}]")
+    print(f"{'='*64}")
+
+    def grade_color(grade, text):
+        if grade in ("A",): return f"\033[92m{text}\033[0m"
+        if grade in ("B",): return f"\033[92m{text}\033[0m"
+        if grade in ("C",): return f"\033[93m{text}\033[0m"
+        if grade in ("D",): return f"\033[91m{text}\033[0m"
+        return f"\033[91m{text}\033[0m"  # F
+
+    pg = m['performance_grade']
+    ps = m['performance_score']
+    sg = m['seo_grade']
+    ss = m['seo_score']
+    bg = m['best_practices_grade']
+    bs = m['best_practices_score']
+    ag = m['accessibility_grade']
+    acs = m['accessibility_score']
+
+    print(f"\n  REPORT CARD")
+    print(f"  {'─'*50}")
+    print(f"    Performance:    {grade_color(pg, pg + '  (' + str(ps) + '/100)')}  — How fast your site loads")
+    print(f"    SEO:            {grade_color(sg, sg + '  (' + str(ss) + '/100)')}  — Google search visibility")
+    print(f"    Best Practices: {grade_color(bg, bg + '  (' + str(bs) + '/100)')}  — Security & web standards")
+    print(f"    Accessibility:  {grade_color(ag, ag + '  (' + str(acs) + '/100)')}  — Usability for all users")
+
+    fg = m['fcp_grade']
+    fv = m['fcp_ms']
+    lg = m['lcp_grade']
+    lv = m['lcp_ms']
+    tg = m['tbt_grade']
+    tv = m['tbt_ms']
+    cg = m['cls_grade']
+    cv = round(m['cls'], 3) if m['cls'] is not None else "N/A"
+    sig = m['si_grade']
+    siv = m['si_ms']
+
+    print(f"\n  CORE WEB VITALS")
+    print(f"  {'─'*50}")
+    print(f"    FCP  (First Paint)      :  {grade_color(fg, fg + '  ' + str(fv) + 'ms')}")
+    print(f"         Time until user sees anything on screen")
+    print(f"    LCP  (Largest Paint)    :  {grade_color(lg, lg + '  ' + str(lv) + 'ms')}")
+    print(f"         Time until main content is visible")
+    print(f"    TBT  (Blocking Time)    :  {grade_color(tg, tg + '  ' + str(tv) + 'ms')}")
+    print(f"         How long the page is frozen/unresponsive")
+    print(f"    CLS  (Layout Shift)     :  {grade_color(cg, cg + '  ' + str(cv))}")
+    print(f"         How much stuff jumps around while loading")
+    print(f"    SI   (Speed Index)      :  {grade_color(sig, sig + '  ' + str(siv) + 'ms')}")
+    print(f"         How quickly page content fills in visually")
+
+    # Synopsis for sales reps
+    print(f"\n  SALES REP SYNOPSIS")
+    print(f"  {'─'*50}")
+    for line in m.get("synopsis", "").split("\n"):
+        print(f"  {line}")
+
+    print()
+
+    print()
+
+
+def save_json(results, filepath):
+    existing = []
+    if os.path.exists(filepath):
+        with open(filepath) as f:
+            existing = json.load(f)
+    existing.extend(results)
+    with open(filepath, "w") as f:
+        json.dump(existing, f, indent=2, default=str)
+    print(f"JSON saved: {filepath}")
+
+
+def save_csv(results, filepath):
+    flat_keys = [k for k in results[0] if k not in ("seo_issues", "opportunities")]
+    file_exists = os.path.exists(filepath)
+
+    with open(filepath, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=flat_keys)
+        if not file_exists:
+            writer.writeheader()
+        for r in results:
+            row = {k: r[k] for k in flat_keys}
+            writer.writerow(row)
+    print(f"CSV saved:  {filepath}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="PageSpeed Insights Logger")
+    parser.add_argument("urls", nargs="*", help="URLs to analyze")
+    parser.add_argument("--file", "-f", help="File with URLs (one per line)")
+    parser.add_argument("--strategy", "-s", default="mobile",
+                        choices=["mobile", "desktop", "both"])
+    parser.add_argument("--output-dir", "-o", default=LOG_DIR)
+    args = parser.parse_args()
+
+    urls = list(args.urls)
+    if args.file:
+        with open(args.file) as f:
+            urls.extend(line.strip() for line in f if line.strip() and not line.startswith("#"))
+
+    # Interactive mode — ask for input if no URLs provided
+    if not urls:
+        print("")
+        print("  ================================")
+        print("   PageSpeed Insights Logger")
+        print("  ================================")
+        print("")
+        count = 1
+        while True:
+            url = input(f"  [{count}] Enter URL: ").strip()
+            if not url:
+                if not urls:
+                    print("\n  No URLs provided. Exiting.")
+                    sys.exit(0)
+                add_more = input("\n  Add another URL? (y/n): ").strip().lower()
+                if add_more == "y":
+                    continue
+                break
+            urls.append(url)
+            count += 1
+        print(f"\n  URLs queued: {len(urls)}")
+        for u in urls:
+            print(f"    - {u}")
+        print("")
+        print("  Select strategy:")
+        print("    1) Mobile")
+        print("    2) Desktop")
+        print("    3) Both")
+        print("")
+        strat_input = input("  Choice [1/2/3] (default: 3): ").strip()
+        if strat_input == "1":
+            args.strategy = "mobile"
+        elif strat_input == "2":
+            args.strategy = "desktop"
+        else:
+            args.strategy = "both"
+        print("")
+
+    # Ensure URLs have scheme
+    urls = [u if u.startswith("http") else f"https://{u}" for u in urls]
+
+    strategies = ["mobile", "desktop"] if args.strategy == "both" else [args.strategy]
+    api_key = get_api_key()
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    datestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    json_path = os.path.join(args.output_dir, f"report_{datestamp}.json")
+    csv_path = os.path.join(args.output_dir, f"report_{datestamp}.csv")
+
+    all_results = []
+    total = len(urls) * len(strategies)
+    current = 0
+
+    for url in urls:
+        for strat in strategies:
+            current += 1
+            print(f"[{current}/{total}] Analyzing {url} ({strat})...", end=" ", flush=True)
+            try:
+                raw = fetch_pagespeed(url, strategy=strat, api_key=api_key)
+                metrics = extract_metrics(raw)
+                all_results.append(metrics)
+                print(f"done - perf:{metrics['performance_score']} seo:{metrics['seo_score']}")
+                print_report(metrics)
+            except requests.exceptions.HTTPError as e:
+                print(f"ERROR: {e}")
+            except Exception as e:
+                print(f"ERROR: {e}")
+
+            if current < total:
+                time.sleep(1)  # rate limit courtesy
+
+    if all_results:
+        save_json(all_results, json_path)
+        save_csv(all_results, csv_path)
+        print(f"\nDone! {len(all_results)} results logged to {args.output_dir}/")
+
+
+if __name__ == "__main__":
+    main()
